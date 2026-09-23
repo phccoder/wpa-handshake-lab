@@ -14,7 +14,6 @@ Two strategies behind one menu:
 - **Auto-installs dependencies** on first run (`aircrack-ng hcxtools hostapd dnsmasq tcpdump tshark hashcat`) via `apt`/`dnf`/`pacman`.
 - **Detects your adapter's real capabilities** from the kernel (`monitor` and `AP` support) — no guesswork.
 - **Proves monitor RX works** with a tcpdump frame test before claiming it does, and routes you to the AP-lab flow if it doesn't.
-- **Remembers your adapter and lab directory** in `~/.wormgpt-lab.conf`, so you only pick once per machine.
 - Timestamps every capture so nothing overwrites.
 - Restores NetworkManager cleanly on exit.
 
@@ -32,7 +31,7 @@ Optional arguments:
 sudo ./handshake-cap.sh <iface> [lab_dir]
 ```
 
-First launch: adapters are listed, pick one by number (or press ENTER to reuse the saved one). Missing tools are installed automatically.
+First launch: adapters are listed, pick one by number. Missing tools are installed automatically.
 
 ## Menu
 
