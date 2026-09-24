@@ -112,6 +112,21 @@ sudo ./quick-capture.sh <iface> "<SSID>" [seconds] [client_mac]
 # client_mac (optional) = targeted deauth of ONE client; omit to deauth every listed client targeted
 ```
 
+### evil-twin.sh (rogue AP)
+
+Attacks the "nobody reconnects" problem from the other side: instead of just deauthing, it **spins up a fake AP with the same SSID** on the same channel and boots clients off the real AP, so their device auto-reconnects to *our* AP and performs a fresh 4-way handshake, which we capture.
+
+```bash
+sudo ./evil-twin.sh <iface> ["<SSID>" [channel]]   # omit SSID to pick from a scan
+```
+
+Key caveats:
+
+- **Needs monitor + AP at the same time** → two virtual interfaces on the card. Most USB cards (incl. `rtw88`-family) cannot, so the script degrades to a plain targeted-deauth capture and asks if that's OK. For the full burglar-robed twin you want a **second dongle** or a card like `ath9k`/mPCIe that supports concurrent modes.
+- The rogue AP advertises WPA2 with a *random* passphrase, so a client's saved key won't complete the handshake — but message 1/2 are captured, which is all `aircrack-ng` needs to verify password guesses.
+- **The password is still only recovered by cracking the captured handshake with a wordlist.** The evil twin just makes the handshake actually happen; it never hands you the key directly.
+- Handshake check runs every 5s with a "keep attacking?" prompt every 60s, mirroring option 2. Passwords get a crack prompt at the end.
+
 ## Menu
 
 ```
