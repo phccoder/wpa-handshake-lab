@@ -107,8 +107,9 @@ First launch: adapters are listed, pick one by number. Missing tools are install
 One-shot automated capture for a single target SSID. Deletes previous `cap-*` files for that target, scans, probes DATA-RX, deauths, captures, and verifies:
 
 ```bash
-sudo ./quick-capture.sh <iface> "<SSID>" [seconds]
+sudo ./quick-capture.sh <iface> "<SSID>" [seconds] [client_mac]
 # default: wlp2s0, "KKOCHI SAMGYUP - 2.4G", 45s
+# client_mac (optional) = targeted deauth of ONE client; omit to deauth every listed client targeted
 ```
 
 ## Menu
@@ -120,18 +121,25 @@ sudo ./quick-capture.sh <iface> "<SSID>" [seconds]
 4) Capture WPA3/SAE                    (monitor)
 5) WPA2 lab AP (hostapd) - NO monitor  (works on this card)
 6) Diagnose capabilities/monitor RX
-7) Show captured files
+7) View / delete captured files
 8) Virtual WiFi lab (software, mac80211_hwsim)
 9) Exit
 ```
 
 - **1** — full-band scan; pick your network by number.
-- **2** — capture a handshake (deauth a client or have one reconnect during the run). Output: `cap-<timestamp>-01.cap`.
+- **2** — capture a handshake. Its deauth step offers a **5s re-fired deauth loop** that auto-stops the moment `aircrack-ng` sees a handshake, and asks whether to keep kicking after each 60s round. A failed run prints a **postmortem** (EAPOL count, deauths seen, frames sent by the target client) to say whether the client was on the wrong radio or PMF-blocked:
+  - **[a]ll clients** — every client in the live station table is deauth'd *targeted* (refreshed each round, so newly-joined clients get kicked too); broadcast only if none are listed.
+  - **[c]hoose a client** — lists the live clients on the target channel (parsed from airodump's station table); you pick one and it's deauth'd targeted every 5s.
+  - **[b]roadcast** — deauths everyone on the channel (weakest option; many clients now ignore broadcast deauth, and 802.11w/PMF clients drop all unauthenticated deauths).
+  - **[m]anual client MAC** — type a specific address, looped.
+  - Targeted deauth only reaches clients on the **same radio/channel as the target** — if your phone is on the 5GHz radio while you're deauthing the 2.4GHz BSSID, nothing happens. Re-scan and pick the other radio's BSSID (they appear as separate networks in airodump's list), or move the phone to 2.4GHz.
+  - Output: `cap-<timestamp>-01.cap`.
 - **3** — `hcxdumptool` PMKID capture, needs no connected client. Output: `hash.22000`.
 - **4** — `hcxdumptool` WPA3/SAE capture, needs a client connecting during the run. Output: `hash.22000`.
 - **5** — the AP lab: creates an SSID on your own card. Connect a phone with the passphrase → the 4-way handshake is captured (`ap-hs-<timestamp>.pcap`), extracted to a `hashcat -m 22000` hash, and optionally demo-cracked against a generated wordlist containing your passphrase.
 - **6** — capability probe: monitor support, AP support, monitor RX (any frames), and DATA-RX (frames of type `2`, i.e. data). Menu header keeps these results.
-- **8** — loads `mac80211_hwsim radios=3`, brings up AP + station + monitor interfaces, auto-connects the station to a demo SSID (`TEST-AP` / `virtpass123`), captures the handshake, extracts a `22000` hash, and runs a hashcat demo crack. Fully offline.
+- **7** — list every capture with its **result** (`WPA (N handshake)` per `aircrack-ng` check). From here you can **[c]rack** a capture against a wordlist (prints `KEY FOUND! [ password ]` when the passphrase is in the list), **[h]ash**-crack any `.22000` files with hashcat, or delete an individual capture (with sidecars) / everything.
+- **8** — loads `mac80211_hwsim radios=3`, brings up AP + station + monitor interfaces, auto-connects the station to your SSID, captures the handshake, extracts a `22000` hash (hashcat demo), then **auto-cracks the capture with `aircrack -w`** against a demo wordlist containing the password — you'll see `KEY FOUND! [ password ]`. Fully offline.
 
 ## Outputs
 
@@ -188,7 +196,7 @@ This tool exists for learning and security testing on **your own equipment and n
   sudo tshark -r <capture.cap> -Y 'wlan.fc.type eq 2' -T fields -e wlan.da | sort -u
   ```
   If only `Broadcast` appears, use options 5/8 or a USB adapter.
-- **Handshake doesn't appear** → reconnect a client to the target during capture; deauth only works against a client that is currently connected.
+- **Handshake doesn't appear / deauth has no effect** → client isn't on the target's radio (pick that BSSID/channel via option 1), the client ignores unauthenticated deauths (802.11w/PMF), or the client is connected via a mesh backhaul. Use option 2's `[c]hoose a client` for a targeted kick, and if the phone still won't drop, just toggle its WiFi to force the reconnect — the handshake is what matters.
 - **WiFi doesn't come back after exit** → cleanup already runs `rfkill unblock`, restarts NetworkManager, and calls `nmcli device connect`. If you Ctrl+C hard:
   ```bash
   sudo systemctl restart NetworkManager wpa_supplicant
