@@ -103,6 +103,38 @@ capabilities() {
 }
 
 # ---------------------------------------------------------------- monitor RX
+# Realtek rtw88-family USB cards (RTL8811AU/8821AU/8812AU) go permanently deaf
+# in monitor mode after interface churn (monitor/managed toggles + airmon-ng
+# kill): RX drops to ~0 frames until the driver is reloaded or the dongle is
+# replugged. A full module reload at the start of the monitor session fixes it.
+# Verified on kernel 7.0: before reload 0-6 frames/15s, after reload 131 (ch11)
+# and 85 (ch157) frames/15s on a TP-Link 802.11ac (2357:0120).
+RTW_RELOADED=0
+rtw88_reload() {
+    local drv m
+    drv="$(basename "$(readlink "/sys/class/net/$IFACE/device/driver" 2>/dev/null)" 2>/dev/null)"
+    case "$drv" in
+        rtw_8821au|rtw_8812au|rtw_8814au|rtw88_8821au|rtw88_8812au|rtw88_8814au) ;;
+        *) return 0 ;;  # not a reload-affected driver
+    esac
+    [[ $RTW_RELOADED -eq 1 ]] && return
+    RTW_RELOADED=1
+    yellow "[*] Reloading $drv to clear the rtw88 USB RX stall..."
+    nmcli device set "$IFACE" managed no >/dev/null 2>&1 || true
+    ip link set "$IFACE" down >/dev/null 2>&1 || true
+    # unload the whole rtw88 family in reverse dependency order (plain rmmod:
+    # always works, and out-of-tree .ko files may be missing from /lib/modules)
+    for _ in 1 2 3 4 5; do
+        for m in $(ls /sys/module 2>/dev/null | grep -E '^(rtw88_|rtw_)' | tr '\n' ' '); do
+            rmmod "$m" >/dev/null 2>&1 || true
+        done
+    done
+    modprobe "$drv" >/dev/null 2>&1 || yellow "    (could not reload $drv - continuing)"
+    sleep 3
+    ip link set "$IFACE" up >/dev/null 2>&1 || true
+    green "[+] $drv reloaded."
+}
+
 # Demonstration in this lab found mt7921e captures DATA frames only when the
 # MAIN interface is set to monitor directly ("iw dev set type monitor").
 # airmon-ng's separate "ifacemon" vif receives beacons but drops data frames.
@@ -111,7 +143,11 @@ enter_monitor() {
     [[ $MON_ENTERED -eq 1 ]] && return
     yellow "[*] Stopping NetworkManager to free the card (net drops; restored on exit)..."
     airmon-ng check kill >/dev/null 2>&1 || true
+    rtw88_reload
     cyan "[*] Enabling monitor mode on $IFACE via direct iw..."
+    # disable power-save BEFORE the mode switch (chip sleeps and never wakes
+    # in monitor without an AP; setting it before AND after is what works)
+    iw dev "$IFACE" set power_save off 2>/dev/null || true
     ip link set "$IFACE" down
     iw dev "$IFACE" set type monitor 2>/dev/null
     ip link set "$IFACE" up
@@ -120,6 +156,10 @@ enter_monitor() {
     [[ -n "$MON_IF" ]] || die "No monitor interface created"
     MON_METHOD="iw"
     MON_ENTERED=1
+    # Realtek rtw88-family USB cards (8811au/8821au/8812au) receive ~0 frames in
+    # monitor while power-save is on: with no AP link the chip stays asleep and
+    # nothing wakes it. Verified fix on Kernel 7.0 (in-kernel rtw88_8821au).
+    iw dev "$MON_IF" set power_save off 2>/dev/null || true
     green "[+] Monitor interface: $MON_IF"
 }
 
@@ -129,6 +169,14 @@ find_mon_iface() {
     [[ -n "$m" ]] && { echo "$m"; return; }
     [[ -e "/sys/class/net/${IFACE}mon" ]] && { echo "${IFACE}mon"; return; }
     [[ -e "/sys/class/net/$IFACE" ]] && { echo "$IFACE"; return; }
+}
+
+# USB adapters get wlx<mac> names whose device dir is the USB *interface*
+# (1-3:1.0); the product string lives on the parent USB device (1-3).
+usb_prod() {
+    local d="/sys/class/net/$1/device" p
+    p="$(cat "$d/product" 2>/dev/null || cat "$d/../product" 2>/dev/null || cat "$d/interface" 2>/dev/null)"
+    echo "${p:-unknown}"
 }
 
 # Find the channel with the most visible APs; mt7921e cannot be reliably
@@ -296,7 +344,7 @@ scan_wifi() {
     if [[ ${#AP_BSSID[@]} -eq 0 ]]; then
         red "[-] No networks captured. Monitor RX: $([[ $MON_RX -eq 1 ]] && echo OK || echo BROKEN)."
         red "    Card info:"
-        echo "    adapter: $(cat /sys/class/net/$MON_IF/device/product 2>/dev/null)"
+        echo "    adapter: $(usb_prod "$MON_IF")"
         echo "    driver : $(basename "$(readlink /sys/class/net/$MON_IF/device/driver 2>/dev/null)" 2>/dev/null)"
         [[ $HAS_AP -eq 1 ]] && green "    -> Switch to the AP-lab flow (option 5)."
         return 1
@@ -704,19 +752,37 @@ pick_interface() {
 
 # ---------------------------------------------------------------- menu
 main_menu() {
-    local mon_label ap_label
+    local mon_label ap_label data_label
     while true; do
         clear
         banner
         echo "[ Main Menu ]  iface: $IFACE | dir: $OUT_DIR"
+        # NOTE: use if/elif here, NOT "a && green || b && red || yellow" chains -
+        # &&/|| are left-associative so green can run AND red run for the same case.
         if [[ $HAS_MON -eq 1 ]]; then
-            mon_label=$( [[ $MON_RX -eq 1 ]] && green "OK" || [[ $MON_RX -eq 0 ]] && red "BROKEN" || yellow "untested" )
-            data_label=$( [[ $MON_RX_DATA -eq 1 ]] && green "OK" || [[ $MON_RX_DATA -eq 0 ]] && red "BROKEN" || yellow "untested" )
+            if [[ $MON_RX -eq 1 ]]; then
+                mon_label=$(green "OK")
+            elif [[ $MON_RX -eq 0 ]]; then
+                mon_label=$(red "BROKEN")
+            else
+                mon_label=$(yellow "untested")
+            fi
+            if [[ $MON_RX_DATA -eq 1 ]]; then
+                data_label=$(green "OK")
+            elif [[ $MON_RX_DATA -eq 0 ]]; then
+                data_label=$(red "BROKEN")
+            else
+                data_label=$(yellow "untested")
+            fi
         else
             mon_label=$(red "unsupported")
             data_label=$(red "unsupported")
         fi
-        ap_label=$( [[ $HAS_AP -eq 1 ]] && green "OK" || red "unsupported" )
+        if [[ $HAS_AP -eq 1 ]]; then
+            ap_label=$(green "OK")
+        else
+            ap_label=$(red "unsupported")
+        fi
         printf '    monitor RX : %s      DATA-RX: %s        AP mode : %s\n' "$mon_label" "$data_label" "$ap_label"
         if [[ -n "$TARGET_BSSID" ]]; then
             cyan "    Target: $TARGET_BSSID  (ch $TARGET_CH)  '$TARGET_ESSID'"

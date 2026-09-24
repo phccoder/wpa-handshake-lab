@@ -49,6 +49,26 @@ ls -1 "$OUT"/cap-* 2>/dev/null | wc -l | xargs echo "   remaining cap files:"
 
 echo "== Entering monitor mode on $IFACE (direct iw: mt7921e drops data frames on airmon vif)"
 airmon-ng check kill >/dev/null 2>&1
+# rtw88-family USB cards go deaf in monitor after interface churn; reload clears it
+RTW_RELOADED=0
+DRV="$(basename "$(readlink "/sys/class/net/$IFACE/device/driver" 2>/dev/null)" 2>/dev/null)"
+case "${DRV:-}" in
+    rtw_8821au|rtw_8812au|rtw_8814au|rtw88_8821au|rtw88_8812au|rtw88_8814au)
+        echo "   reloading $DRV to clear the rtw88 USB RX stall..."
+        nmcli device set "$IFACE" managed no >/dev/null 2>&1 || true
+        ip link set "$IFACE" down >/dev/null 2>&1 || true
+        for pass in 1 2 3 4 5; do
+            for m in $(ls /sys/module 2>/dev/null | grep -E '^(rtw88_|rtw_)' | tr '\n' ' '); do
+                rmmod "$m" >/dev/null 2>&1 || true
+            done
+        done
+        modprobe "$DRV" >/dev/null 2>&1
+        sleep 3
+        ip link set "$IFACE" up >/dev/null 2>&1 || true
+        RTW_RELOADED=1
+        ;;
+esac
+iw dev "$IFACE" set power_save off 2>/dev/null || true
 ip link set "$IFACE" down
 iw dev "$IFACE" set type monitor 2>/dev/null
 ip link set "$IFACE" up
@@ -56,6 +76,8 @@ MON_METHOD="iw"
 sleep 2
 MON_IF="$IFACE"
 ip link set "$MON_IF" up 2>/dev/null
+# rtw88-family USB cards stay asleep in monitor unless power-save is off
+iw dev "$MON_IF" set power_save off 2>/dev/null || true
 green "   monitor iface: $MON_IF"
 
 # Scan for busiest channel; also doubles as RX sanity (beacons visible => RX works)

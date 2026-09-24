@@ -29,6 +29,7 @@ sudo airmon-ng check kill
 sudo ip link set wlp2s0 down
 sudo iw dev wlp2s0 set type monitor
 sudo ip link set wlp2s0 up
+sudo iw dev wlp2s0 set power_save off   # Realtek USB cards RX nothing in monitor otherwise
 ```
 
 and captures with `airodump-ng -c <channel>` on a **fixed channel**. Avoid `iw dev ... set channel` after a scan on `mt7921e` — the card goes deaf; `airodump-ng -c` sets the channel itself.
@@ -44,6 +45,46 @@ EAPOL 4-way frames are unicast (AP ↔ client), so **this card can never capture
 1. **Option 5** (AP lab) — handshake is produced by a client joining your own `hostapd` AP.
 2. **Option 8** (virtual lab) — fully software-emulated, produces and cracks a real 4-way handshake offline.
 3. **USB adapter** — a monitor-capable dongle that passes unicast frames (e.g. Alfa AWUS036ACH / RTL8812AU, RTL8814AU) enables the monitor flow for real-world captures.
+
+## Known fix: rtw88-family USB cards that see 0 frames in monitor
+
+Realtek USB dongles (TP-Link 802.11ac, chips RTL8811AU/8821AU/8812AU) can enter
+monitor mode yet receive **nothing** — 0 frames on any channel — while the radio
+works fine in managed mode. Three things fix it:
+
+1. **Use the in-kernel `rtw88_*` driver** (kernel 6.14+). The out-of-tree
+   `lwfinger/rtw88` DKMS build can be the culprit. Clean it up:
+   `sudo dkms remove rtw88/0.6 --all`, unload stragglers with
+   `sudo rmmod rtw_88xxa rtw_core` (plain `rmmod`, not `modprobe -r` — the .ko
+   files are gone), and delete the in-kernel blacklists the out-of-tree install
+   wrote into `/etc/modprobe.d/rtw88.conf`. Then `sudo modprobe rtw88_8821au`
+   (or `rtw88_8812au`).
+2. **Reload the driver before each monitor session.** After monitor/managed
+   churn (toggles + `airmon-ng check kill`) these cards go deaf: RX drops to
+   ~0 frames until the whole rtw88 stack is reloaded (even a fresh association
+   does not recover it). The monitor flow in this script reloads
+   `rtw88_8812au`/`rtw88_8821au` automatically once per session.
+3. **Disable power-save in monitor**: `sudo iw dev <iface> set power_save off`.
+   With the chip asleep and no AP left to wake it, the card never delivers a
+   frame. The monitor flow sets this before and after the mode switch.
+
+Verified: TP-Link 802.11ac (2357:0120), kernel 7.0.0 — 0-6 frames/15s (stalled
+driver) → 131 frames/15s on ch11 and 85 on ch157 right after a module reload.
+
+**Optional long-term hardening** — address the stall at the source so reloads
+matter less. Disable USB autosuspend for the dongle's ID and stop
+NetworkManager from shovelling the card back into power-save:
+
+```sh
+# match your bus ID: lsusb | grep -i realtek  (e.g. 2357:0120)
+echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2357", ATTR{idProduct}=="0120", ATTR{power/autosuspend}="-1", ATTR{power/control}="on"' | sudo tee /etc/udev/rules.d/99-usb-wifi.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo nmcli radio wifi off && sudo nmcli radio wifi on   # replug equivalent (or reboot)
+sudo nmcli connection modify Starlink_Main wifi.powersave 2 || true
+sudo sed -i 's/^#*wifi.powersave.*/wifi.powersave = 2/' /etc/NetworkManager/conf.d/* 2>/dev/null || \
+  printf '[connection]\nwifi.powersave = 2\n' | sudo tee /etc/NetworkManager/conf.d/no-powersave.conf
+sudo systemctl restart NetworkManager
+```
 
 ---
 
@@ -141,7 +182,7 @@ This tool exists for learning and security testing on **your own equipment and n
 
 ## Troubleshooting
 
-- **"No networks seen" in scan** → run option 6. If the monitor RX test shows 0 frames on the busiest channel, your card's driver can't do monitor mode on this kernel (common with in-kernel `rtw88` on Realtek 88xxAU). Use the AP-lab flow (option 5) or the virtual lab (option 8).
+- **"No networks seen" in scan** → run option 6. If the monitor RX test shows 0 frames on the busiest channel, your card's driver can't do monitor mode on this kernel. For rtw88-family USB cards (RTL8821AU/8812AU etc.) see the ["Known fix: rtw88-family USB cards"](#known-fix-rtw88-family-usb-cards-that-see-0-frames-in-monitor) section — make sure power-save is off in monitor and you're on the in-kernel driver. Otherwise use the AP-lab flow (option 5) or the virtual lab (option 8).
 - **`DATA-RX OK` but `0 handshake`** → the card passes broadcast data but drops unicast EAPOL (typical of `mt7921e`). Confirm by checking your capture's destinations:
   ```bash
   sudo tshark -r <capture.cap> -Y 'wlan.fc.type eq 2' -T fields -e wlan.da | sort -u
