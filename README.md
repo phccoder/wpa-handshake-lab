@@ -138,7 +138,7 @@ sudo ./quick-capture.sh <iface> "<SSID>" [seconds] [client_mac]
 - **4** — `hcxdumptool` WPA3/SAE capture, needs a client connecting during the run. Output: `hash.22000`.
 - **5** — the AP lab: creates an SSID on your own card. Connect a phone with the passphrase → the 4-way handshake is captured (`ap-hs-<timestamp>.pcap`), extracted to a `hashcat -m 22000` hash, and optionally demo-cracked against a generated wordlist containing your passphrase.
 - **6** — capability probe: monitor support, AP support, monitor RX (any frames), and DATA-RX (frames of type `2`, i.e. data). Menu header keeps these results.
-- **7** — list every capture with its **result** (`WPA (N handshake)` per `aircrack-ng` check). From here you can **[c]rack** a capture against a wordlist (prints `KEY FOUND! [ password ]` when the passphrase is in the list), **[h]ash**-crack any `.22000` files with hashcat, or delete an individual capture (with sidecars) / everything.
+- **7** — list every capture with its **result** (`WPA (N handshake)` per `aircrack-ng` check). From here you can **[c]rack** a capture against a wordlist (prints `KEY FOUND! [ password ]` when the passphrase is in the list), **[h]ash**-crack any `.22000` files with hashcat, **[w]ordlist**-set which list to use (path, or `d` to download), or delete an individual capture (with sidecars) / everything.
 - **8** — loads `mac80211_hwsim radios=3`, brings up AP + station + monitor interfaces, auto-connects the station to your SSID, captures the handshake, extracts a `22000` hash (hashcat demo), then **auto-cracks the capture with `aircrack -w`** against a demo wordlist containing the password — you'll see `KEY FOUND! [ password ]`. Fully offline.
 
 ## Outputs
@@ -186,7 +186,15 @@ This tool exists for learning and security testing on **your own equipment and n
 - Linux with `sudo`
 - A wireless adapter. Any adapter for the AP-lab flow; a monitor-capable card for the passive flow (with the unicast caveat above); **no hardware needed** for the virtual lab (option 8).
 - `mac80211_hwsim` kernel module for option 8 (usually built-in: `sudo modprobe mac80211_hwsim`)
-- Internet on first run (dependency install)
+- Internet on first run (dependency install + automatic wordlist download)
+
+## Auto-setup
+
+On startup the tool tries to do everything for you:
+
+1. **Deps** — installs any missing tools via `apt`/`dnf`/`pacman` (with timeouts and a mirror-reachability probe so it degrades gracefully instead of hanging when offline).
+2. **Wordlist** — looks for your saved setting (`SAVED_WORDLIST` in `~/.wormgpt-lab.conf`), then common paths, and if none exists **downloads `Pwdb_top-100000.txt`** (100k common passwords) to `/usr/share/wordlists/`.
+3. **Saved settings** — interface, capture dir and wordlist are remembered across runs. Point it at a different wordlist anytime from option 7 → `[w]`. You can always crack a specific capture with any list manually via option 7 → `[c]`.
 
 ## Troubleshooting
 

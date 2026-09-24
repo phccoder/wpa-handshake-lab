@@ -794,22 +794,59 @@ EOF
 }
 
 # ---------------------------------------------------------------- misc
-# locate a wordlist under common paths (rockyou.txt)
+WORDLIST_URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/Pwdb_top-100000.txt"
+WORDLIST_DEFAULT="/usr/share/wordlists/Pwdb_top-100000.txt"
+
+download_wordlist() {
+    WL_PATH="$WORDLIST_DEFAULT"
+    mkdir -p "$(dirname "$WL_PATH")"
+    yellow "[*] Downloading ~100k common passwords to $WL_PATH ..."
+    if curl -fLsS -o "$WL_PATH" "$WORDLIST_URL"; then
+        green "[+] Wordlist ready: $WL_PATH"
+        save_conf
+        return 0
+    fi
+    WL_PATH=""
+    red "[-] Wordlist download failed (offline?) - you can set one manually later."
+    return 1
+}
+
+# locate a wordlist: saved setting first, then common paths
 resolve_wordlist() {
     local w
-    for w in "$HOME/rockyou.txt" "$HOME/seclists/rockyou.txt" \
-             /usr/share/wordlists/rockyou-75.txt /usr/share/wordlists/rockyou.txt \
+    [[ -n "${WL_PATH:-}" && -f "$WL_PATH" ]] && { echo "$WL_PATH"; return; }
+    for w in "${SAVED_WORDLIST:-}" "$HOME/rockyou.txt" "$HOME/seclists/rockyou.txt" "$HOME/.wordlist.txt" \
+             "$WORDLIST_DEFAULT" /usr/share/wordlists/rockyou.txt \
              /usr/share/seclists/Passwords/rockyou.txt; do
-        [[ -f "$w" ]] && { echo "$w"; return; }
+        [[ -n "$w" && -f "$w" ]] && { echo "$w"; return; }
     done
+}
+
+# ensure a wordlist exists: saved setting -> known paths -> auto-download
+ensure_wordlist() {
+    local w
+    if [[ -n "${WL_PATH:-}" && -f "$WL_PATH" ]]; then return 0; fi
+    w="$(resolve_wordlist)"
+    if [[ -n "$w" ]]; then
+        WL_PATH="$w"
+        save_conf
+        return 0
+    fi
+    download_wordlist
 }
 
 # crack one WPA .cap with aircrack-ng and print the KEY if found
 crack_capture() {
     local f="$1" wl="${2:-}" res key
-    [[ -n "$wl" && -f "$wl" ]] || wl="$(resolve_wordlist)"
-    if [[ -z "$wl" ]]; then
-        read -r -p "[>] Wordlist path (e.g. /usr/share/wordlists/rockyou.txt): " wl
+    if [[ -z "$wl" || ! -f "$wl" ]]; then
+        wl="$(resolve_wordlist)"
+        if [[ -z "$wl" ]]; then
+            read -r -p "[>] Wordlist path, 'd' to download 100k common passwords, ENTER to cancel: " wl
+        fi
+    fi
+    if [[ "${wl,,}" == "d" ]]; then
+        download_wordlist || return 1
+        wl="$WL_PATH"
     fi
     [[ -f "$wl" ]] || { yellow "    wordlist not found: $wl"; return 1; }
     cyan "[*] Cracking $f with $(basename "$wl") - big lists take minutes..."
@@ -826,17 +863,36 @@ crack_capture() {
 
 # crack any hashcat 22000 hashes present (PMKID / AP-lab / virtual-lab output)
 crack_hashes() {
-    local wl h
+    local wl h es rest
     command -v hashcat >/dev/null 2>&1 || { yellow "    hashcat not installed (sudo apt install hashcat)"; return; }
     local -a hs=()
-    for h in *.22000; do [[ -f "$h" ]] && hs+=("$h"); done
+    local cap base
+    if command -v hcxpcapngtool >/dev/null 2>&1; then
+        for cap in cap-*.cap ap-hs-*.pcap; do
+            [[ -f "$cap" ]] || continue
+            aircrack-ng "$cap" 2>/dev/null | grep -q 'WPA (' || continue
+            base="${cap%.*}"
+            if [[ ! -s "$base.22000" ]]; then
+                yellow "[*] Extracting handshake: $cap -> $base.22000"
+                hcxpcapngtool "$cap" -o "$base.22000" >/dev/null 2>&1 || true
+            fi
+        done
+    fi
+    for h in *.22000; do [[ -f "$h" && -s "$h" ]] && hs+=("$h"); done
     [[ ${#hs[@]} -eq 0 ]] && { yellow "    (no .22000 hashes here)"; return; }
     wl="$(resolve_wordlist)"
     [[ -z "$wl" ]] && read -r -p "[>] Wordlist path: " wl
     [[ -f "$wl" ]] || { yellow "    wordlist not found: $wl"; return; }
     for h in "${hs[@]}"; do yellow "[*] hashcat -m 22000 $h"; hashcat -m 22000 "$h" "$wl" >/dev/null 2>&1 || true; done
     echo
-    hashcat -m 22000 --show "${hs[@]}" 2>/dev/null || true
+    cyan "[*] Recovered passwords:"
+    local n=0
+    while IFS=: read -r _ _ _ es rest; do
+        [[ -n "$es" ]] || continue
+        n=$((n+1))
+        green "    [+] network: $es   password: $rest"
+    done < <(hashcat -m 22000 --show "${hs[@]}" 2>/dev/null)
+    [[ $n -eq 0 ]] && yellow "    (none - try a bigger wordlist, or it just didn't crack)"
     echo
 }
 
@@ -863,7 +919,8 @@ show_captures() {
     done
     echo
     echo "    [n]umber = delete that capture   [a]ll = delete everything"
-    echo "    [c]rack a capture (find the password)    [h]ash = crack .22000   0 = back"
+    echo "    [c]rack a capture (find the password)    [h]ash = crack .22000"
+    echo "    [w]ordlist settings   (current: ${WL_PATH:-none})   0 = back"
     read -r -p "[>] Your choice: " pick
     case "$pick" in
         c|C)
@@ -876,6 +933,25 @@ show_captures() {
             ;;
         h|H)
             crack_hashes
+            ;;
+        w|W)
+            if [[ -n "${WL_PATH:-}" && -f "$WL_PATH" ]]; then
+                yellow "[-] Current wordlist: $WL_PATH"
+            else
+                yellow "[-] No wordlist set yet."
+            fi
+            read -r -p "[>] New path, 'd' to download 100k common passwords, ENTER to keep: " newwl
+            if [[ "${newwl,,}" == "d" ]]; then
+                download_wordlist
+            elif [[ -n "$newwl" ]]; then
+                if [[ -f "$newwl" ]]; then
+                    WL_PATH="$newwl"
+                    save_conf
+                    green "    saved: $WL_PATH"
+                else
+                    yellow "    not a file: $newwl"
+                fi
+            fi
             ;;
         a|A)
             read -r -p "[>] Delete ALL capture files? (y/N): " y
@@ -921,7 +997,8 @@ load_conf() {
     [[ -f "$CONF" ]] && { . "$CONF" 2>/dev/null || true; } || true
 }
 save_conf() {
-    printf 'SAVED_IFACE=%s\nSAVED_OUT_DIR=%s\n' "$IFACE" "$OUT_DIR" > "$CONF" 2>/dev/null || true
+    printf 'SAVED_IFACE=%s\nSAVED_OUT_DIR=%s\nSAVED_WORDLIST=%s\n' \
+        "$IFACE" "$OUT_DIR" "${WL_PATH:-}" > "$CONF" 2>/dev/null || true
 }
 
 install_deps() {
@@ -929,51 +1006,46 @@ install_deps() {
     local bins=(aircrack-ng iw hostapd dnsmasq tcpdump hcxpcapngtool hcxdumptool tshark hashcat)
     local miss=() t pm still=() i
     for i in "${!pkgs[@]}"; do
-        if ! command -v "${bins[$i]}" >/dev/null 2>&1; then
-            miss+=("${pkgs[$i]}")
-            [[ $i -ge 5 ]] &&
-                yellow "    note: ${pkgs[$i]} (${bins[$i]}) not installed - option 3/4/8 features degrade"
-        fi
+        command -v "${bins[$i]}" >/dev/null 2>&1 || miss+=("${pkgs[$i]}")
     done
     if [[ ${#miss[@]} -eq 0 ]]; then
-        green "    all required tools present"
-        return
-    fi
-    if command -v apt-get >/dev/null; then pm=apt
-    elif command -v dnf >/dev/null; then pm=dnf
-    elif command -v pacman >/dev/null; then pm=pacman
-    fi
-    if [[ -z "$pm" ]]; then
-        red "[-] Missing tools: ${miss[*]} - install them for your distro."
-        return
-    fi
-    yellow "[*] Installing missing tools: ${miss[*]} (may need network, ~60s max)"
-    if [[ "$pm" == apt ]]; then
-        local uri host
-        uri="$(grep -rhoE 'https?://[^ /]+' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null | grep -v 'security' | head -1)"
-        host="${uri#*://}"; host="${host%%/*}"
-        if [[ -n "$host" ]] && ! timeout 5 bash -c "</dev/tcp/${host}/80" >/dev/null 2>&1 \
-                                 && ! timeout 5 bash -c "</dev/tcp/${host}/443" >/dev/null 2>&1; then
-            yellow "    apt mirror $host unreachable - skipping install (flows that miss tools degrade, rest work)"
-            return
+        green "    all tools present"
+    else
+        if command -v apt-get >/dev/null; then pm=apt
+        elif command -v dnf >/dev/null; then pm=dnf
+        elif command -v pacman >/dev/null; then pm=pacman
+        fi
+        if [[ -n "$pm" ]]; then
+            yellow "[*] Installing missing tools: ${miss[*]} (may need network, ~3min max)"
+            if [[ "$pm" == apt ]]; then
+                local uri host
+                uri="$(grep -rhoE 'https?://[^ /]+' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null | grep -v 'security' | head -1)"
+                host="${uri#*://}"; host="${host%%/*}"
+                if [[ -z "$host" ]] || { timeout 5 bash -c "</dev/tcp/${host}/80" >/dev/null 2>&1 || timeout 5 bash -c "</dev/tcp/${host}/443" >/dev/null 2>&1; }; then
+                    case "$pm" in
+                        apt)
+                            timeout 90 sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update' >/dev/null 2>&1 \
+                                || yellow "    apt update failed (offline?) - trying install anyway"
+                            timeout 150 env DEBIAN_FRONTEND=noninteractive apt-get install -y "${miss[@]}" >/dev/null 2>&1 || true ;;
+                        dnf)   timeout 150 dnf install -y "${miss[@]}" >/dev/null 2>&1 || true ;;
+                        pacman) timeout 150 pacman -Sy --noconfirm "${miss[@]}" >/dev/null 2>&1 || true ;;
+                    esac
+                else
+                    yellow "    apt mirror $host unreachable - skipping install, flows degrade"
+                fi
+            fi
+        else
+            red "[-] Missing tools: ${miss[*]} - install them for your distro."
+        fi
+        for i in "${!pkgs[@]}"; do
+            command -v "${bins[$i]}" >/dev/null 2>&1 || still+=("${pkgs[$i]}")
+        done
+        if [[ ${#still[@]} -gt 0 ]]; then
+            red "[-] Still missing: ${still[*]}"
+            yellow "    Affected options degrade; rerun after fixing network/apt."
         fi
     fi
-    case "$pm" in
-        apt)
-            timeout 45 sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update' >/dev/null 2>&1 \
-                || yellow "    apt update failed (offline?) - trying install anyway"
-            timeout 120 env DEBIAN_FRONTEND=noninteractive apt-get install -y "${miss[@]}" >/dev/null 2>&1 || true ;;
-        dnf)   timeout 120 dnf install -y "${miss[@]}" >/dev/null 2>&1 || true ;;
-        pacman) timeout 120 pacman -Sy --noconfirm "${miss[@]}" >/dev/null 2>&1 || true ;;
-    esac
-    for i in "${!pkgs[@]}"; do
-        [[ $i -ge 5 ]] && continue
-        command -v "${bins[$i]}" >/dev/null 2>&1 || still+=("${pkgs[$i]}")
-    done
-    if [[ ${#still[@]} -gt 0 ]]; then
-        red "[-] Still missing (required): ${still[*]}"
-        yellow "    Capture/AP flows need these. Fix apt first (see README) then rerun."
-    fi
+    ensure_wordlist
 }
 
 pick_interface() {
@@ -1075,9 +1147,9 @@ main() {
     [[ $EUID -eq 0 ]] || die "Run with sudo: sudo ./handshake-cap.sh"
 
     cyan "[*] Checking/installing dependencies..."
+    load_conf
     install_deps
 
-    load_conf
     [[ -z "${2:-}" ]] && [[ -n "${SAVED_OUT_DIR:-}" ]] && OUT_DIR="$SAVED_OUT_DIR"
     if [[ -z "$IFACE" ]]; then
         pick_interface
